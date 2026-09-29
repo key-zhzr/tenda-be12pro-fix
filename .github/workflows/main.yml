@@ -10,11 +10,12 @@ on:
       variant:
         description: Patch variant
         required: true
-        default: vendorfix-noeee
+        default: vendorfix-mdio-debug
         type: choice
         options:
           - vendorfix
           - vendorfix-noeee
+          - vendorfix-mdio-debug
 
 permissions:
   contents: read
@@ -70,12 +71,18 @@ jobs:
             git apply ../control/patches/0002-an8855-disable-eee-rft.patch
           fi
 
+          if [ "${{ inputs.variant }}" = "vendorfix-mdio-debug" ]; then
+            git apply --check ../control/patches/0003-an8855-mdio-phy-debug-rft.patch
+            git apply ../control/patches/0003-an8855-mdio-phy-debug-rft.patch
+          fi
+
           echo '===== PATCHED FILES ====='
           git diff --check
           git diff --stat
           git diff -- \
             target/linux/mediatek/files-6.18/drivers/net/dsa/an8855.c \
             target/linux/mediatek/files-6.18/drivers/net/dsa/an8855.h \
+            target/linux/mediatek/files-6.18/drivers/net/mdio/mdio-an8855.c \
             target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
 
       - name: Initialize build environment
