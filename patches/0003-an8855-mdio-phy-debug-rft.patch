@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000003 Mon Sep 17 00:00:00 2001
+From: ChatGPT RFT <rft@example.invalid>
+Date: Wed, 30 Sep 2026 01:30:00 +0800
+Subject: [PATCH 3/3] mediatek: an8855: trace MDIO and PHY link-state transitions
+
+RFT diagnostics for the BE12 Pro AN8855 multi-port link failure seen
+with Linux 6.18.
+
+The failure can now be reproduced without DHCP, firewall or bridging:
+when a second AN8855 user port establishes link, the previously linked
+port is reported down roughly one polling interval later. Each port can
+link successfully when tested on its own.
+
+Instrument the AN8855 MDIO passthrough path without adding extra BMSR
+reads there. This records the exact BMCR/BMSR values consumed by phylib,
+along with the switch-page bookkeeping state, so latch-low BMSR events
+and MDIO/page-selection problems can be distinguished.
+
+Also wrap genphy_read_status() in the AN8855 PHY driver and dump the
+negotiation registers only when the software link state changes. The
+wrapper deliberately does not pre-read BMSR, avoiding interference with
+the latch-low semantics being investigated.
+
+This patch is diagnostic only.
+
+---
+ .../files-6.18/drivers/net/mdio/mdio-an8855.c | 35 ++++++++++++++++++
+ .../files-6.18/drivers/net/phy/air_an8855.c   | 42 ++++++++++++++++++++++
+ 2 files changed, 77 insertions(+)
+
+diff --git a/target/linux/mediatek/files-6.18/drivers/net/mdio/mdio-an8855.c b/target/linux/mediatek/files-6.18/drivers/net/mdio/mdio-an8855.c
+index 5feba72c021b..444444444444 100644
+--- a/target/linux/mediatek/files-6.18/drivers/net/mdio/mdio-an8855.c
++++ b/target/linux/mediatek/files-6.18/drivers/net/mdio/mdio-an8855.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/mfd/airoha-an8855-mfd.h>
++#include <linux/mii.h>
+ #include <linux/module.h>
+ #include <linux/of_mdio.h>
+ #include <linux/platform_device.h>
+@@ -24,6 +25,12 @@ static int an855_phy_restore_page(struct an8855_mfd_priv *priv,
+ 	return an8855_mii_set_page(priv, phy, AN8855_PHY_PAGE_STANDARD);
+ }
+ 
++static bool an8855_rft_trace_read_reg(int regnum)
++{
++	return regnum == MII_BMCR || regnum == MII_BMSR;
++}
++
+ static int an8855_phy_read(struct mii_bus *bus, int phy, int regnum)
+ {
+ 	struct an8855_mfd_priv *priv = bus->priv;
+@@ -38,6 +45,22 @@ static int an8855_phy_read(struct mii_bus *bus, int phy, int regnum)
+ 		goto exit;
+ 
+ 	ret = __mdiobus_read(real_bus, phy, regnum);
++	if (an8855_rft_trace_read_reg(regnum)) {
++		if (ret < 0)
++			dev_info(&bus->dev,
++				 "AN8855-RFT-MDIO: read phy=%d reg=0x%02x error=%d current_page=%u switch_addr=%u\n",
++				 phy, regnum, ret, priv->current_page,
++				 priv->switch_addr);
++		else
++			dev_info(&bus->dev,
++				 "AN8855-RFT-MDIO: read phy=%d reg=0x%02x val=0x%04x current_page=%u switch_addr=%u\n",
++				 phy, regnum, ret, priv->current_page,
++				 priv->switch_addr);
++	}
+ exit:
+ 	mutex_unlock(&real_bus->mdio_lock);
+ 
+@@ -57,6 +80,18 @@ static int an8855_phy_write(struct mii_bus *bus, int phy, int regnum, u16 val)
+ 		goto exit;
+ 
+ 	ret = __mdiobus_write(real_bus, phy, regnum, val);
++	if (regnum == MII_BMCR || regnum == AN8855_PHY_SELECT_PAGE)
++		dev_info(&bus->dev,
++			 "AN8855-RFT-MDIO: write phy=%d reg=0x%02x val=0x%04x ret=%d current_page=%u switch_addr=%u\n",
++			 phy, regnum, val, ret, priv->current_page,
++			 priv->switch_addr);
+ exit:
+ 	mutex_unlock(&real_bus->mdio_lock);
+ 
+diff --git a/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c b/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
+index cf10b7a9a89e..555555555555 100644
+--- a/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
++++ b/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
+@@ -194,9 +194,50 @@ static int an8855_config_init(struct phy_device *phydev)
+ 	if (ret)
+ 		return ret;
+ 
++	dev_info(dev, "AN8855-RFT-PHY: config-init addr=%d flags=%#x\n",
++		 phydev->mdio.addr, phydev->dev_flags);
++
+ 	return 0;
+ }
+ 
++static int an8855_read_status(struct phy_device *phydev)
++{
++	struct device *dev = &phydev->mdio.dev;
++	int old_link = phydev->link;
++	int bmcr, adv, lpa, ctrl1000, stat1000;
++	int ret;
++
++	/*
++	 * Do not pre-read BMSR here. Linux 6.18 intentionally preserves the
++	 * latch-low indication for polling PHYs while link is up. The MDIO
++	 * passthrough trace records the exact BMSR read(s) made by
++	 * genphy_read_status().
++	 */
++	ret = genphy_read_status(phydev);
++	if (ret < 0) {
++		dev_info(dev,
++			 "AN8855-RFT-PHY: addr=%d read-status error=%d old_link=%d new_link=%d\n",
++			 phydev->mdio.addr, ret, old_link, phydev->link);
++		return ret;
++	}
++
++	if (old_link == phydev->link)
++		return 0;
++
++	bmcr = phy_read(phydev, MII_BMCR);
++	adv = phy_read(phydev, MII_ADVERTISE);
++	lpa = phy_read(phydev, MII_LPA);
++	ctrl1000 = phy_read(phydev, MII_CTRL1000);
++	stat1000 = phy_read(phydev, MII_STAT1000);
++
++	dev_info(dev,
++		 "AN8855-RFT-PHY: addr=%d link=%d->%d autoneg=%d complete=%d speed=%d duplex=%d bmcr=%#06x adv=%#06x lpa=%#06x ctrl1000=%#06x stat1000=%#06x\n",
++		 phydev->mdio.addr, old_link, phydev->link, phydev->autoneg,
++		 phydev->autoneg_complete, phydev->speed, phydev->duplex,
++		 bmcr, adv, lpa, ctrl1000, stat1000);
++
++	return 0;
++}
++
+ static int an8855_get_tunable(struct phy_device *phydev,
+ 			      struct ethtool_tunable *tuna, void *data)
+ {
+@@ -241,6 +282,7 @@ static struct phy_driver an8855_driver[] = {
+ 	.flags			= PHY_IS_INTERNAL,
+ 	.probe			= an8855_probe,
+ 	.config_init		= an8855_config_init,
++	.read_status		= an8855_read_status,
+ 	.soft_reset		= genphy_soft_reset,
+ 	.get_tunable		= an8855_get_tunable,
+ 	.set_tunable		= an8855_set_tunable,
+-- 
+2.43.0
