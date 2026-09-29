@@ -1,0 +1,187 @@
+name: Build BE12 Pro AN8855 RFT
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: ImmortalWrt source ref (commit, tag, or branch)
+        required: true
+        default: 45474b1733debddfde8ce98ff2529b24cf9756ea
+      variant:
+        description: Patch variant
+        required: true
+        default: vendorfix-noeee
+        type: choice
+        options:
+          - vendorfix
+          - vendorfix-noeee
+
+permissions:
+  contents: read
+
+concurrency:
+  group: be12pro-an8855-rft-${{ github.ref }}-${{ inputs.variant }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CCACHE_DIR: ${{ github.workspace }}/source/.ccache
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: "3G"
+
+    steps:
+      # Keep the workflow + RFT patches from your repository in ./control.
+      - name: Checkout RFT control files
+        uses: actions/checkout@v4
+        with:
+          path: control
+
+      # Build an otherwise-official ImmortalWrt tree.
+      - name: Checkout official ImmortalWrt
+        uses: actions/checkout@v4
+        with:
+          repository: immortalwrt/immortalwrt
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+          path: source
+
+      - name: Show source revision
+        working-directory: source
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Apply AN8855 RFT patches
+        working-directory: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git apply --check ../control/patches/0001-an8855-vendor-fixes-rft.patch
+          git apply ../control/patches/0001-an8855-vendor-fixes-rft.patch
+
+          if [ "${{ inputs.variant }}" = "vendorfix-noeee" ]; then
+            git apply --check ../control/patches/0002-an8855-disable-eee-rft.patch
+            git apply ../control/patches/0002-an8855-disable-eee-rft.patch
+          fi
+
+          echo '===== PATCHED FILES ====='
+          git diff --check
+          git diff --stat
+          git diff -- \
+            target/linux/mediatek/files-6.18/drivers/net/dsa/an8855.c \
+            target/linux/mediatek/files-6.18/drivers/net/dsa/an8855.h \
+            target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
+
+      - name: Initialize build environment
+        run: |
+          sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          sudo apt-get update
+          sudo apt-get install -y ccache
+          mkdir -p "$CCACHE_DIR"
+          ccache -M "$CCACHE_MAXSIZE"
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: source/dl
+          key: immortalwrt-be12pro-dl-${{ runner.os }}-${{ inputs.source_ref }}
+          restore-keys: |
+            immortalwrt-be12pro-dl-${{ runner.os }}-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: source/.ccache
+          key: immortalwrt-be12pro-ccache-${{ runner.os }}-${{ inputs.source_ref }}-${{ inputs.variant }}-${{ github.run_id }}
+          restore-keys: |
+            immortalwrt-be12pro-ccache-${{ runner.os }}-${{ inputs.source_ref }}-${{ inputs.variant }}-
+            immortalwrt-be12pro-ccache-${{ runner.os }}-${{ inputs.source_ref }}-
+            immortalwrt-be12pro-ccache-${{ runner.os }}-
+
+      - name: Update feeds
+        working-directory: source
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure Tenda BE12 Pro with initramfs
+        working-directory: source
+        shell: bash
+        run: |
+          cat > .config <<'EOF'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_filogic=y
+          CONFIG_TARGET_mediatek_filogic_DEVICE_tenda_be12-pro=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_ROOTFS_INITRAMFS=y
+          CONFIG_CCACHE=y
+          EOF
+
+          make defconfig
+
+          echo '===== TARGET CONFIG ====='
+          grep -E '^CONFIG_TARGET_|^CONFIG_TARGET_ROOTFS_|^CONFIG_CCACHE=' .config || true
+
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_tenda_be12-pro=y$' .config
+          grep -q '^CONFIG_TARGET_ROOTFS_INITRAMFS=y$' .config
+
+      - name: Download sources
+        working-directory: source
+        run: |
+          make download -j"$(nproc)"
+          find dl -type f -size -1024c -delete || true
+
+      - name: Build firmware
+        working-directory: source
+        shell: bash
+        run: |
+          set -o pipefail
+          ccache --zero-stats || true
+
+          if ! make -j"$(nproc)"; then
+            echo '::warning::Parallel build failed; retrying serially with V=s'
+            make -j1 V=s
+          fi
+
+          ccache --show-stats || true
+
+      - name: Collect BE12 Pro images
+        working-directory: source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OUT="bin/targets/mediatek/filogic"
+          DEST="${GITHUB_WORKSPACE}/artifact"
+          mkdir -p "$DEST"
+
+          find "$OUT" -maxdepth 1 -type f -name '*tenda_be12-pro*' -print
+          find "$OUT" -maxdepth 1 -type f -name '*tenda_be12-pro*' -exec cp -v {} "$DEST/" \;
+
+          [ -f "$OUT/sha256sums" ] && cp "$OUT/sha256sums" "$DEST/"
+          [ -f "$OUT/profiles.json" ] && cp "$OUT/profiles.json" "$DEST/"
+
+          printf '%s\n' "source_ref=${{ inputs.source_ref }}" > "$DEST/RFT_BUILD_INFO.txt"
+          printf '%s\n' "variant=${{ inputs.variant }}" >> "$DEST/RFT_BUILD_INFO.txt"
+          git rev-parse HEAD >> "$DEST/RFT_BUILD_INFO.txt"
+
+          if ! find "$DEST" -type f -name '*initramfs*' | grep -q .; then
+            echo 'No BE12 Pro initramfs image was generated.' >&2
+            exit 1
+          fi
+
+          sha256sum "$DEST"/* > "$DEST/RFT_SHA256SUMS"
+          ls -lh "$DEST"
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: be12pro-an8855-${{ inputs.variant }}
+          path: artifact/*
+          if-no-files-found: error
+          retention-days: 30
