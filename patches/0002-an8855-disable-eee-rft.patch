@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: ChatGPT RFT <rft@example.invalid>
+Date: Tue, 29 Sep 2026 20:41:00 +0800
+Subject: [PATCH 2/2] mediatek: an8855: disable PHY EEE as a 6.18 RFT workaround
+
+Linux 6.18 has substantially different phylink-managed EEE handling
+from the 6.6 kernel on which this AN8855 downstream driver was first
+used. The AN8855 DSA driver does not yet describe managed LPI support
+through the modern phylink interface.
+
+For RFT purposes, explicitly disable EEE at the AN8855 internal PHYs.
+This mirrors the conservative approach used by other switch PHY drivers
+when MAC-side EEE/LPI support has not been validated.
+
+This patch is intentionally separate from the PMCR/vendor-fix patch so
+it can be A/B tested.
+
+---
+ .../mediatek/files-6.18/drivers/net/phy/air_an8855.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c b/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
+index cf10b7a9a89e..333333333333 100644
+--- a/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
++++ b/target/linux/mediatek/files-6.18/drivers/net/phy/air_an8855.c
+@@ -137,6 +137,12 @@ static int an8855_config_init(struct phy_device *phydev)
+ 	struct device *dev = &phydev->mdio.dev;
+ 	int ret;
+ 
++	/* RFT: keep EEE out of the equation until AN8855's MAC-side LPI
++	 * behaviour has been validated with Linux 6.18 phylink.
++	 */
++	phy_disable_eee(phydev);
++	dev_info(dev, "AN8855-RFT: EEE disabled for PHY address %d\n", phydev->mdio.addr);
++
+ 	/* Enable HW auto downshift */
+ 	ret = an8855_set_downshift(phydev, DOWNSHIFT_DEV_DEFAULT_COUNT);
+ 	if (ret)
+-- 
+2.43.0
