@@ -50,12 +50,22 @@ cp /etc/be12pro-backups/实际目录/firewall /etc/config/firewall
 
 在 Ubuntu / Debian WSL2 中用普通用户执行，编译目录放在 Linux 文件系统内。首次建议预留至少 40 GiB；脚本会安装依赖，并按可用内存限制默认并行任务数。
 
-PR 合并前：
+依赖安装默认给本次 `apt-get update/install` 添加 `Acquire::ForceIPv4=true`，避免 WSL 中不可达的 IPv6 路由阻塞安装。需要使用系统默认地址选择时，设置 `APT_FORCE_IPV4=0`。若旧脚本报 Ubuntu 源 IPv6 地址 `Network is unreachable`，且依赖已装好，也可使用下面的 `SKIP_DEPS=1` 命令继续；需要安装依赖时，请更新脚本。
+
+脚本和修复补丁默认从稳定的 `main` 分支获取：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/key-zhzr/tenda-be12pro-fix/fix/multiwan-identity/build-be12pro-wsl.sh -o ~/build-be12pro-wsl.sh
+curl -fL https://raw.githubusercontent.com/key-zhzr/tenda-be12pro-fix/main/build-be12pro-wsl.sh -o ~/build-be12pro-wsl.sh
 bash ~/build-be12pro-wsl.sh
 ```
+
+如果旧脚本报 `fatal: couldn't find remote ref fix/multiwan-identity`，这是 PR 合并后临时分支已删除。依赖已经安装时，直接在原编译目录继续：
+
+```bash
+CONTROL_REF=main SKIP_DEPS=1 bash ~/build-be12pro-wsl.sh
+```
+
+不必删除 `source`、`control` 或更换 `WORKROOT`。新版脚本会恢复获取分支时中断的未检出仓库。
 
 默认为 `PATCHSET=multiwan`。只有需要继续收集底层寄存器日志时，才选择：
 
@@ -70,8 +80,8 @@ JOBS=4 bash ~/build-be12pro-wsl.sh
 SKIP_DEPS=1 bash ~/build-be12pro-wsl.sh
 PREPARE_ONLY=1 bash ~/build-be12pro-wsl.sh
 EXTRA_PACKAGES='luci-app-ttyd ttyd' bash ~/build-be12pro-wsl.sh
-# 合并后可以改用 main；首次切换源码/补丁可用新的 WORKROOT。
-CONTROL_REF=main WORKROOT="$HOME/be12pro-main-wsl" bash ~/build-be12pro-wsl.sh
+# 指定其它补丁版本时，可使用仍存在的分支或完整提交 SHA。
+CONTROL_REF=main bash ~/build-be12pro-wsl.sh
 ```
 
 下载缓存、工具链和 ccache 会复用；源码/补丁变化时清理目标内核和根文件系统，避免继续使用旧驱动。切换补丁变体前需要 `RESET_SOURCE=1` 或新的 `WORKROOT`。`RESET_SOURCE=1` 会丢弃这个专用源码目录中的 tracked 修改，勿用于自己的开发目录。
