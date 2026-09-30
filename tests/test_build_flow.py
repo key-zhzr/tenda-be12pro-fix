@@ -72,9 +72,26 @@ class BuildFlowTests(unittest.TestCase):
         executable(cls.bin / "sudo", '#!/bin/sh\nexec "$@"\n')
         executable(cls.bin / "apt-get", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TEST_APT_LOG"\n')
         executable(cls.bin / "make", """#!/usr/bin/env python3
-import os, sys
+import json, os, sys
 from pathlib import Path
 with open(os.environ['TEST_MAKE_LOG'], 'a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')
+if os.environ.get('TEST_NETWORK_LOG'):
+    keys = ('CURL_OPTIONS', 'WGET_OPTIONS', 'http_proxy', 'https_proxy', 'all_proxy',
+            'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'no_proxy', 'NO_PROXY')
+    with open(os.environ['TEST_NETWORK_LOG'], 'a') as f:
+        f.write(json.dumps({key: os.environ.get(key) for key in keys}) + '\\n')
+if 'download' in sys.argv and os.environ.get('MOCK_DOWNLOAD_FAILURE'):
+    if 'V=s' not in sys.argv:
+        print('ERROR: tools/libdeflate failed to build.', file=sys.stderr)
+        sys.exit(41)
+    if os.environ['MOCK_DOWNLOAD_FAILURE'] == 'persistent':
+        print('MOCK: detailed libdeflate failure from verbose retry', file=sys.stderr)
+        sys.exit(42)
+if sys.argv[1:] == ['-j1']:
+    out = Path('bin/targets/mediatek/filogic')
+    out.mkdir(parents=True, exist_ok=True)
+    for image in ('tenda_be12-pro-initramfs.bin', 'tenda_be12-pro-sysupgrade.bin'):
+        (out / image).write_text('mock firmware for build-flow tests')
 if 'defconfig' in sys.argv:
     path=Path('.config')
     omit=os.environ.get('MOCK_MISSING_PACKAGE', 'luci-i18n-smartdns-zh-cn')
@@ -163,6 +180,55 @@ if 'defconfig' in sys.argv:
         self.assertEqual(run("git", "rev-parse", "HEAD", cwd=control).stdout.strip(), desired)
         self.assertEqual((control / "retry-marker").read_text(), "new main revision")
         self.assertEqual(cache.read_text(), "reusable download")
+
+    def test_download_retry_reports_cause_and_controls_firmware_build(self):
+        for failure in ("persistent", "transient"):
+            with self.subTest(failure=failure):
+                root = self.dir / f"build-download-{failure}"
+                make_log = self.dir / f"make-download-{failure}.log"
+                result = self.builder(self.env(root, PREPARE_ONLY="0", MOCK_DOWNLOAD_FAILURE=failure,
+                                              TEST_MAKE_LOG=str(make_log)), ok=failure == "transient")
+                commands = make_log.read_text().splitlines()
+                self.assertIn("download -j1 V=s", commands)
+                self.assertIn("Download stage failed: retrying serially with V=s", result.stdout)
+                if failure == "persistent":
+                    self.assertEqual(result.returncode, 42)
+                    self.assertIn("MOCK: detailed libdeflate failure", result.stdout)
+                    self.assertEqual(commands[-1], "download -j1 V=s")
+                    self.assertFalse((root / "source/bin").exists())
+                    self.assertFalse(list(root.glob("output-*")))
+                else:
+                    self.assertEqual(commands[-3:], ["download -j1", "download -j1 V=s", "-j1"])
+                    self.assertIn("Build complete:", result.stdout)
+                    self.assertEqual(len(list(root.glob("output-*/SHA256SUMS"))), 1)
+
+    def test_download_ipv4_options_and_explicit_proxy_reach_build_commands(self):
+        import json
+        root = self.dir / "build-network"
+        network_log = self.dir / "network.log"
+        env = self.env(root, TEST_NETWORK_LOG=str(network_log), CURL_OPTIONS="--retry 7",
+                       WGET_OPTIONS="--timeout=9", http_proxy="http://existing.invalid:7999")
+        env.pop("DOWNLOAD_FORCE_IPV4", None)
+        env.pop("BUILD_PROXY", None)
+        self.builder(env)
+        values = json.loads(network_log.read_text().splitlines()[-1])
+        self.assertEqual(values["CURL_OPTIONS"], "--retry 7 --ipv4")
+        self.assertEqual(values["WGET_OPTIONS"], "--timeout=9 --inet4-only")
+        self.assertEqual(values["http_proxy"], env["http_proxy"])
+        network_log.write_text("")
+        self.builder({**env, "DOWNLOAD_FORCE_IPV4": "0"})
+        values = json.loads(network_log.read_text().splitlines()[-1])
+        self.assertEqual(values["CURL_OPTIONS"], "--retry 7")
+        self.assertEqual(values["WGET_OPTIONS"], "--timeout=9")
+        proxy = "http://fixture:dummy-token@127.0.0.1:7890"
+        network_log.write_text("")
+        result = self.builder({**env, "BUILD_PROXY": proxy, "no_proxy": "localhost", "NO_PROXY": "localhost"})
+        values = json.loads(network_log.read_text().splitlines()[-1])
+        for key in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            self.assertEqual(values[key], proxy)
+        self.assertEqual(values["no_proxy"], "localhost")
+        self.assertEqual(values["NO_PROXY"], "localhost")
+        self.assertNotIn(proxy, result.stdout)
 
     def test_all_patch_variants_apply_and_are_idempotent(self):
         for variant in ("multiwan", "multiwan-mdio-debug", "vendorfix", "vendorfix-noeee", "vendorfix-mdio-debug"):

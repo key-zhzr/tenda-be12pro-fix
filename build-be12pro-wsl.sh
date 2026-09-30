@@ -15,6 +15,8 @@ Environment overrides:
   CONTROL_REF=main                  Stable branch containing merged fixes
   SKIP_DEPS=1                       Skip apt dependency installation
   APT_FORCE_IPV4=0                   Use system defaults; apt uses IPv4 by default
+  DOWNLOAD_FORCE_IPV4=0              Use system defaults for curl/wget downloads
+  BUILD_PROXY=http://HOST:PORT        HTTP(S) proxy for Git and source downloads
   PREPARE_ONLY=1                    Configure and verify, without firmware build
   CLEAN=1                           Rebuild toolchain with make dirclean
   RESET_SOURCE=1                    Discard tracked changes in the dedicated source
@@ -50,6 +52,21 @@ mkdir -p "$WORKROOT/logs"
 LOGFILE="$WORKROOT/logs/build-$STAMP.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 trap 'rc=$?; printf "Build failed (%s). Log: %s\n" "$rc" "$LOGFILE" >&2; exit "$rc"' ERR
+case ${DOWNLOAD_FORCE_IPV4:-1} in
+  1)
+    # The pinned scripts/download.pl reads these options for every mirror.
+    export CURL_OPTIONS="${CURL_OPTIONS:+$CURL_OPTIONS }--ipv4"
+    export WGET_OPTIONS="${WGET_OPTIONS:+$WGET_OPTIONS }--inet4-only"
+    ;;
+  0) ;;
+  *) die 'DOWNLOAD_FORCE_IPV4 must be 0 or 1.' ;;
+esac
+if [[ -n ${BUILD_PROXY:-} ]]; then
+  [[ "$BUILD_PROXY" =~ ^https?://[^[:space:]]+$ ]] || die 'BUILD_PROXY must be an http:// or https:// proxy URL.'
+  export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" all_proxy="$BUILD_PROXY"
+  export HTTP_PROXY="$BUILD_PROXY" HTTPS_PROXY="$BUILD_PROXY" ALL_PROXY="$BUILD_PROXY"
+  log 'Explicit HTTP(S) proxy enabled for Git and source downloads.'
+fi
 if [[ ${SKIP_DEPS:-0} != 1 ]]; then
   command -v apt-get >/dev/null || die 'This script requires Ubuntu/Debian apt-get.'
   deps=(build-essential clang flex bison gawk gettext git libncurses-dev
@@ -143,7 +160,10 @@ if [[ ${PREPARE_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 log 'Downloading build sources'
-make download -j"$JOBS"
+if ! make download -j"$JOBS"; then
+  log 'Download stage failed: retrying serially with V=s, including prerequisite host tools.'
+  make download -j1 V=s
+fi
 log 'Building BE12 Pro images'
 if ! make -j"$JOBS"; then
   log 'Retrying serially with V=s to report the first actionable build error.'
