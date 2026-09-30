@@ -1,0 +1,39 @@
+name: Validate BE12 Pro repair scripts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      IMMORTALWRT_SOURCE: ${{ github.workspace }}/source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: control
+      - uses: actions/checkout@v4
+        with:
+          repository: immortalwrt/immortalwrt
+          ref: 45474b1733debddfde8ce98ff2529b24cf9756ea
+          fetch-depth: 1
+          path: source
+      - name: Shell syntax and whitespace
+        working-directory: control
+        run: |
+          for file in build-be12pro-wsl.sh scripts/*.sh; do bash -n "$file"; done
+          for file in files/usr/libexec/*.sh files/usr/bin/*.sh files/etc/uci-defaults/*; do sh -n "$file"; done
+          git diff --check
+      - name: Configuration migration regression checks
+        working-directory: control
+        run: python3 tests/test_multiwan.py
+      - name: Patch variants and build-flow regression checks
+        working-directory: control
+        run: python3 tests/test_build_flow.py

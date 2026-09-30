@@ -1,0 +1,28 @@
+From: key-zhzr <a344480211@gmail.com>
+Subject: [PATCH] mediatek: BE12 Pro: create three DHCP WANs without shadowing IPv6
+
+config_generate supports protocol=dhcp but does not handle protocol=dhcpv6
+in board.json. Explicit DHCPv6 board entries overwrite the automatically
+created IPv6 interfaces with proto=none. Define only IPv4 here, and set
+IPv6 options and per-port MAC/client identities in the first-boot helper.
+
+This is the requested custom multi-WAN layout; eth1/eth2 have no default
+logical interfaces.
+
+diff --git a/target/linux/mediatek/filogic/base-files/etc/board.d/02_network b/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+--- a/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
++++ b/target/linux/mediatek/filogic/base-files/etc/board.d/02_network
+@@ -234,7 +234,12 @@
+ 		ucidef_set_interfaces_lan_wan "lan1 lan2" wan
+ 		;;
+ 	tenda,be12-pro)
+-		ucidef_set_interfaces_lan_wan "lan3 lan4 lan5 eth1" eth2
++		# config_generate creates wan16/wan26/wan36 from these DHCPv4 interfaces.
++		# IPv6 options and unique port identities are finalized by uci-defaults.
++		# eth1/eth2 are left without default logical interfaces.
++		ucidef_set_interface "wan1" device "lan3" protocol "dhcp" metric "10"
++		ucidef_set_interface "wan2" device "lan4" protocol "dhcp" metric "20"
++		ucidef_set_interface "wan3" device "lan5" protocol "dhcp" metric "30"
+ 		;;
+ 	tplink,fr365-v1)
+ 		ucidef_set_interfaces_lan_wan "port1 port3 port4 port5 port6" "port2"

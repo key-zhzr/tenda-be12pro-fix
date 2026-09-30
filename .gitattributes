@@ -1,0 +1,2 @@
+# Unified-diff context has a leading space before source indentation.
+patches/*.patch whitespace=-space-before-tab

@@ -1,0 +1,3 @@
+#!/bin/sh
+[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = tenda,be12-pro ] || exit 0
+/usr/libexec/be12pro-multiwan.sh --apply
