@@ -12,8 +12,11 @@ Environment overrides:
   JOBS=4                            Parallel jobs (automatic RAM-aware default)
   PATCHSET=multiwan                  Quiet fix; multiwan-mdio-debug for traces
   SOURCE_REF=45474b1733debddfde8ce98ff2529b24cf9756ea
-  CONTROL_REF=fix/multiwan-identity   PR branch; override with main after merge
+  CONTROL_REF=main                  Stable branch containing merged fixes
   SKIP_DEPS=1                       Skip apt dependency installation
+  APT_FORCE_IPV4=0                   Use system defaults; apt uses IPv4 by default
+  DOWNLOAD_FORCE_IPV4=0              Use system defaults for curl/wget downloads
+  BUILD_PROXY=http://HOST:PORT        HTTP(S) proxy for Git and source downloads
   PREPARE_ONLY=1                    Configure and verify, without firmware build
   CLEAN=1                           Rebuild toolchain with make dirclean
   RESET_SOURCE=1                    Discard tracked changes in the dedicated source
@@ -36,7 +39,7 @@ fi
 SOURCE_REPO=${SOURCE_REPO:-https://github.com/immortalwrt/immortalwrt.git}
 SOURCE_REF=${SOURCE_REF:-45474b1733debddfde8ce98ff2529b24cf9756ea}
 CONTROL_REPO=${CONTROL_REPO:-https://github.com/key-zhzr/tenda-be12pro-fix.git}
-CONTROL_REF=${CONTROL_REF:-fix/multiwan-identity}
+CONTROL_REF=${CONTROL_REF:-main}
 PATCHSET=${PATCHSET:-multiwan}
 WORKROOT=${WORKROOT:-$HOME/be12pro-multiwan-wsl}
 case "$WORKROOT" in *[[:space:]]*) die 'WORKROOT must not contain spaces.' ;; esac
@@ -49,6 +52,21 @@ mkdir -p "$WORKROOT/logs"
 LOGFILE="$WORKROOT/logs/build-$STAMP.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 trap 'rc=$?; printf "Build failed (%s). Log: %s\n" "$rc" "$LOGFILE" >&2; exit "$rc"' ERR
+case ${DOWNLOAD_FORCE_IPV4:-1} in
+  1)
+    # The pinned scripts/download.pl reads these options for every mirror.
+    export CURL_OPTIONS="${CURL_OPTIONS:+$CURL_OPTIONS }--ipv4"
+    export WGET_OPTIONS="${WGET_OPTIONS:+$WGET_OPTIONS }--inet4-only"
+    ;;
+  0) ;;
+  *) die 'DOWNLOAD_FORCE_IPV4 must be 0 or 1.' ;;
+esac
+if [[ -n ${BUILD_PROXY:-} ]]; then
+  [[ "$BUILD_PROXY" =~ ^https?://[^[:space:]]+$ ]] || die 'BUILD_PROXY must be an http:// or https:// proxy URL.'
+  export http_proxy="$BUILD_PROXY" https_proxy="$BUILD_PROXY" all_proxy="$BUILD_PROXY"
+  export HTTP_PROXY="$BUILD_PROXY" HTTPS_PROXY="$BUILD_PROXY" ALL_PROXY="$BUILD_PROXY"
+  log 'Explicit HTTP(S) proxy enabled for Git and source downloads.'
+fi
 if [[ ${SKIP_DEPS:-0} != 1 ]]; then
   command -v apt-get >/dev/null || die 'This script requires Ubuntu/Debian apt-get.'
   deps=(build-essential clang flex bison gawk gettext git libncurses-dev
@@ -58,8 +76,15 @@ if [[ ${SKIP_DEPS:-0} != 1 ]]; then
     autopoint device-tree-compiler python3-ply python3-docutils
     libgmp-dev libmpc-dev libmpfr-dev)
   if [[ $(uname -m) == x86_64 ]]; then deps+=(gcc-multilib g++-multilib); fi
-  sudo apt-get update
-  sudo apt-get install -y "${deps[@]}"
+  # WSL may resolve AAAA records without having a usable IPv6 route.
+  apt_command=(sudo apt-get)
+  case ${APT_FORCE_IPV4:-1} in
+    1) apt_command+=(-o Acquire::ForceIPv4=true) ;;
+    0) ;;
+    *) die 'APT_FORCE_IPV4 must be 0 or 1.' ;;
+  esac
+  "${apt_command[@]}" update
+  "${apt_command[@]}" install -y "${deps[@]}"
 fi
 for tool in git python3 make ccache; do command -v "$tool" >/dev/null || die "Missing dependency: $tool"; done
 if [[ -z ${JOBS:-} ]]; then
@@ -83,7 +108,9 @@ checkout_ref() {
   [[ $(git -C "$dir" remote get-url origin) == "$url" ]] || die "Unexpected origin in $dir"
   git -C "$dir" fetch --no-tags --depth=1 origin "$ref"
   desired=$(git -C "$dir" rev-parse FETCH_HEAD)
-  if [[ "$cloned" == 1 ]]; then
+  # A failed fetch after --no-checkout leaves no index. Recover it even when
+  # the requested ref advanced; an ordinary index must retain its user edits.
+  if [[ "$cloned" == 1 || ! -f "$dir/.git/index" ]]; then
     git -C "$dir" checkout --detach "$desired"
     return
   fi
@@ -96,8 +123,6 @@ checkout_ref() {
   fi
   if [[ $(git -C "$dir" rev-parse HEAD) != "$desired" ]]; then
     [[ -z $(git -C "$dir" status --porcelain --untracked-files=no) ]] || die "Tracked changes in $dir; use a new WORKROOT or RESET_SOURCE=1."
-    git -C "$dir" checkout --detach "$desired"
-  elif [[ -z $(git -C "$dir" ls-files | head -n 1) ]]; then
     git -C "$dir" checkout --detach "$desired"
   fi
 }
@@ -135,7 +160,10 @@ if [[ ${PREPARE_ONLY:-0} == 1 ]]; then
   exit 0
 fi
 log 'Downloading build sources'
-make download -j"$JOBS"
+if ! make download -j"$JOBS"; then
+  log 'Download stage failed: retrying serially with V=s, including prerequisite host tools.'
+  make download -j1 V=s
+fi
 log 'Building BE12 Pro images'
 if ! make -j"$JOBS"; then
   log 'Retrying serially with V=s to report the first actionable build error.'

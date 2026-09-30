@@ -50,12 +50,24 @@ cp /etc/be12pro-backups/实际目录/firewall /etc/config/firewall
 
 在 Ubuntu / Debian WSL2 中用普通用户执行，编译目录放在 Linux 文件系统内。首次建议预留至少 40 GiB；脚本会安装依赖，并按可用内存限制默认并行任务数。
 
-PR 合并前：
+依赖安装默认给本次 `apt-get update/install` 添加 `Acquire::ForceIPv4=true`，避免 WSL 中不可达的 IPv6 路由阻塞安装。需要使用系统默认地址选择时，设置 `APT_FORCE_IPV4=0`。若旧脚本报 Ubuntu 源 IPv6 地址 `Network is unreachable`，且依赖已装好，也可使用下面的 `SKIP_DEPS=1` 命令继续；需要安装依赖时，请更新脚本。
+
+源码包下载也默认使用 IPv4：给已有 `CURL_OPTIONS` / `WGET_OPTIONS` 追加 `--ipv4` / `--inet4-only`，由固定版本的 `scripts/download.pl` 应用于每个镜像。设置 `DOWNLOAD_FORCE_IPV4=0` 可保留系统默认选择。该设置作用于编译主机的下载过程。
+
+脚本和修复补丁默认从稳定的 `main` 分支获取：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/key-zhzr/tenda-be12pro-fix/fix/multiwan-identity/build-be12pro-wsl.sh -o ~/build-be12pro-wsl.sh
+curl -fL https://raw.githubusercontent.com/key-zhzr/tenda-be12pro-fix/main/build-be12pro-wsl.sh -o ~/build-be12pro-wsl.sh
 bash ~/build-be12pro-wsl.sh
 ```
+
+如果旧脚本报 `fatal: couldn't find remote ref fix/multiwan-identity`，这是 PR 合并后临时分支已删除。依赖已经安装时，直接在原编译目录继续：
+
+```bash
+CONTROL_REF=main SKIP_DEPS=1 bash ~/build-be12pro-wsl.sh
+```
+
+不必删除 `source`、`control` 或更换 `WORKROOT`。新版脚本会恢复获取分支时中断的未检出仓库。
 
 默认为 `PATCHSET=multiwan`。只有需要继续收集底层寄存器日志时，才选择：
 
@@ -70,13 +82,38 @@ JOBS=4 bash ~/build-be12pro-wsl.sh
 SKIP_DEPS=1 bash ~/build-be12pro-wsl.sh
 PREPARE_ONLY=1 bash ~/build-be12pro-wsl.sh
 EXTRA_PACKAGES='luci-app-ttyd ttyd' bash ~/build-be12pro-wsl.sh
-# 合并后可以改用 main；首次切换源码/补丁可用新的 WORKROOT。
-CONTROL_REF=main WORKROOT="$HOME/be12pro-main-wsl" bash ~/build-be12pro-wsl.sh
+# 指定其它补丁版本时，可使用仍存在的分支或完整提交 SHA。
+CONTROL_REF=main bash ~/build-be12pro-wsl.sh
 ```
 
 下载缓存、工具链和 ccache 会复用；源码/补丁变化时清理目标内核和根文件系统，避免继续使用旧驱动。切换补丁变体前需要 `RESET_SOURCE=1` 或新的 `WORKROOT`。`RESET_SOURCE=1` 会丢弃这个专用源码目录中的 tracked 修改，勿用于自己的开发目录。
 
 产物位于 `~/be12pro-multiwan-wsl/output-时间/`，包含 sysupgrade、initramfs、配置、日志、源码及 feeds 版本、SHA256SUMS。源码固定到上述提交；feeds 更新到本次构建时的版本并记录 SHA。
+
+下载阶段也可能需要先编译 `libdeflate`、`zstd` 等主机工具。新版脚本在下载或固件编译失败后会自动用 `-j1 V=s` 重试，将下载、解压、编译器等详细错误写入本次构建日志。只出现 `ERROR: tools/libdeflate failed to build` 时，还不能确定底层原因；旧脚本可在已有源码目录中单独重试并采集详细输出：
+
+```bash
+cd ~/be12pro-multiwan-wsl/source
+set -o pipefail
+make tools/libdeflate/compile -j1 V=s 2>&1 | tee ../logs/libdeflate-verbose.log
+```
+
+这一步保留现有构建缓存。成功后重新运行编译脚本；仍失败时，根据 `../logs/libdeflate-verbose.log` 中的具体错误继续处理。
+
+如果详细日志显示所有镜像都报 `curl: (7) Failed to connect`，需要先解决 WSL 的出站连接。旧脚本也可先用 IPv4 重试：
+
+```bash
+CURL_OPTIONS=--ipv4 WGET_OPTIONS=--inet4-only make tools/libdeflate/compile -j1 V=s
+```
+
+若 IPv4 仍不可达、Windows 上有可用的 HTTP / 混合代理，可用 `BUILD_PROXY` 将 Git、feeds 和源码包下载接入该代理。脚本通过标准代理环境变量传递地址，只记录已启用代理，不主动输出代理 URL；已有 `no_proxy` / `NO_PROXY` 仍生效。APT 依赖安装继续使用上面的 IPv4 设置；依赖已装好时使用 `SKIP_DEPS=1`。
+
+WSL 使用 NAT 时，Windows 主机地址通常取自默认网关；使用 mirrored 模式时可用 `127.0.0.1`。NAT 下 Windows 代理需要允许来自 WSL 的连接（例如开启允许局域网连接，并允许对应防火墙端口）。见 [Microsoft WSL 网络文档](https://learn.microsoft.com/windows/wsl/networking)。下例仅适用于 NAT，`7890` 必须改成实际 HTTP / 混合代理端口：
+
+```bash
+proxy_host=$(ip -4 route show default | awk 'NR == 1 {print $3}')
+BUILD_PROXY="http://$proxy_host:7890" SKIP_DEPS=1 bash ~/build-be12pro-wsl.sh
+```
 
 ### 默认接口布局
 

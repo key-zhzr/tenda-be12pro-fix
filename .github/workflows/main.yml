@@ -97,7 +97,11 @@ jobs:
 
       - name: Download sources
         working-directory: source
-        run: make download -j"$(nproc)"
+        run: |
+          if ! make download -j"$(nproc)"; then
+            echo '::warning::Download stage failed; retrying serially with V=s'
+            make download -j1 V=s
+          fi
 
       - name: Build firmware
         working-directory: source
